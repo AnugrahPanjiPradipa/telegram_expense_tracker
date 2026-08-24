@@ -48,7 +48,22 @@ export default async function handler(req: any, res: any) {
   try {
     const text = message.text?.trim();
 
-    // 2. Handle Perintah Rekapitulasi
+    // 2. Handle Perintah Dasar & Rekapitulasi
+    if (text === "/start" || text === "/bantuan") {
+      const welcomeText =
+        `👋 *Halo! Saya Bot Pencatat Pengeluaran.*\n\n` +
+        `Kirimkan catatan pengeluaran dengan cara:\n` +
+        `• *Teks:* "Makan siang 25rb" atau "Bensin 50k"\n` +
+        `• *Foto:* Kirim foto struk/nota belanjaan\n\n` +
+        `*Perintah Rekapitulasi:*\n` +
+        `• /hari_ini - Rekap pengeluaran hari ini\n` +
+        `• /minggu_ini - Rekap pengeluaran 7 hari terakhir\n` +
+        `• /bulan_ini - Rekap pengeluaran bulan berjalan`;
+
+      await sendTelegramMessage(chatId, welcomeText);
+      return res.status(200).send("OK");
+    }
+
     if (
       text === "/hari_ini" ||
       text === "/minggu_ini" ||
