@@ -1,6 +1,17 @@
 import { createClient } from '@supabase/supabase-js';
 
-// 1. Helper Kirim Pesan Telegram (Menggunakan HTML Parse Mode agar anti error parsing)
+async function sendChatAction(token: string, chatId: number, action: 'typing' | 'upload_photo' = 'typing') {
+  try {
+    await fetch(`https://api.telegram.org/bot${token}/sendChatAction`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, action }),
+    });
+  } catch (err) {
+    console.error('Error sendChatAction:', err);
+  }
+}
+
 async function sendTelegram(token: string, chatId: number, text: string) {
   try {
     const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
@@ -9,17 +20,14 @@ async function sendTelegram(token: string, chatId: number, text: string) {
       body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'HTML' }),
     });
     const data = await res.json();
-    if (!data.ok) {
-      console.error('Telegram API Error:', data);
-    }
+    if (!data.ok) console.error('Telegram API Error:', data);
     return data;
   } catch (err) {
     console.error('Network Error sendTelegram:', err);
   }
 }
 
-// 2. Helper Gemini REST API (Structured JSON Extraction)
-async function parseWithGemini(apiKey: string, promptText: string, imageBase64?: string) {
+async function parseExpensesWithGemini(apiKey: string, promptText: string, imageBase64?: string) {
   const parts: any[] = [{ text: promptText }];
   if (imageBase64) {
     parts.unshift({
@@ -39,11 +47,25 @@ async function parseWithGemini(apiKey: string, promptText: string, imageBase64?:
           response_schema: {
             type: 'OBJECT',
             properties: {
-              amount: { type: 'NUMBER', description: 'Total nominal angka saja' },
-              category: { type: 'STRING', description: 'Kategori (Makanan, Transportasi, Belanja, Tagihan, Lainnya)' },
-              description: { type: 'STRING', description: 'Rincian atau keterangan transaksi' },
+              intent: { 
+                type: 'STRING', 
+                description: 'Tujuan user: "ADD_EXPENSE" jika mencatat, "DELETE_ALL" jika meminta menghapus semua data, "DELETE_LAST" jika menghapus input terakhir' 
+              },
+              items: {
+                type: 'ARRAY',
+                description: 'Daftar item belanja jika intent ADD_EXPENSE',
+                items: {
+                  type: 'OBJECT',
+                  properties: {
+                    description: { type: 'STRING', description: 'Nama barang / keterangan' },
+                    amount: { type: 'NUMBER', description: 'Nominal harga angka saja' },
+                    category: { type: 'STRING', description: 'Kategori (Makanan, Minuman, Belanja, Transportasi, Tagihan, Lainnya)' },
+                  },
+                  required: ['description', 'amount', 'category'],
+                },
+              },
             },
-            required: ['amount', 'category', 'description'],
+            required: ['intent', 'items'],
           },
         },
       }),
@@ -57,13 +79,11 @@ async function parseWithGemini(apiKey: string, promptText: string, imageBase64?:
 
   const json = await res.json();
   const rawText = json.candidates?.[0]?.content?.parts?.[0]?.text;
-  return JSON.parse(rawText || '{}');
+  return JSON.parse(rawText || '{"intent":"ADD_EXPENSE","items":[]}');
 }
 
 export default async function handler(req: any, res: any) {
-  if (req.method !== 'POST') {
-    return res.status(200).send('Webhook is active!');
-  }
+  if (req.method !== 'POST') return res.status(200).send('Webhook active');
 
   const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN?.trim();
   const ALLOWED_USER_ID = process.env.ALLOWED_USER_ID ? Number(process.env.ALLOWED_USER_ID.trim()) : null;
@@ -71,70 +91,84 @@ export default async function handler(req: any, res: any) {
   const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY?.trim();
   const GEMINI_KEY = process.env.GEMINI_API_KEY?.trim();
 
-  if (!BOT_TOKEN) {
-    console.error('Missing TELEGRAM_BOT_TOKEN');
-    return res.status(200).send('Missing BOT_TOKEN');
-  }
+  if (!BOT_TOKEN) return res.status(200).send('Missing token');
 
-  // Parse Body Update Telegram
   let update = req.body;
   if (typeof update === 'string') {
-    try {
-      update = JSON.parse(update);
-    } catch (e) {
-      console.error('JSON body parse error:', e);
-    }
+    try { update = JSON.parse(update); } catch { return res.status(200).send('Bad JSON'); }
   }
 
   const message = update?.message;
-  if (!message) {
-    return res.status(200).send('No message received');
-  }
+  if (!message) return res.status(200).send('No message');
 
   const chatId = message.chat.id;
   const userId = message.from.id;
   const text = message.text?.trim() || message.caption?.trim() || '';
 
-  // Validasi User ID
   if (ALLOWED_USER_ID && userId !== ALLOWED_USER_ID) {
-    await sendTelegram(BOT_TOKEN, chatId, `⛔ Akses ditolak. Akun kamu (<code>${userId}</code>) belum diizinkan.`);
+    await sendTelegram(BOT_TOKEN, chatId, `⛔ Akses ditolak. ID Anda: <code>${userId}</code>`);
     return res.status(200).send('OK');
   }
 
-  // 1. Perintah Start / Bantuan
+  // 1. Menu Perintah Cepat
   if (text === '/start' || text === '/bantuan') {
     const welcomeText =
-      `👋 <b>Halo! Saya Bot Pencatat Pengeluaran.</b>\n\n` +
-      `Kirimkan catatan pengeluaran dengan cara:\n` +
-      `• <b>Teks:</b> "Makan siang 25rb" atau "Beli bensin 50k"\n` +
-      `• <b>Foto:</b> Kirim foto nota / struk belanjaan\n\n` +
+      `👋 <b>Halo! Bot Pencatat Pengeluaran Siap Digunakan.</b>\n\n` +
+      `<b>Cara Input:</b>\n` +
+      `• Teks: "Makan siang 25rb"\n` +
+      `• Foto: Kirim foto struk belanja\n\n` +
       `<b>Perintah Rekap:</b>\n` +
-      `• /hari_ini - Rekap hari ini\n` +
-      `• /minggu_ini - Rekap 7 hari terakhir\n` +
-      `• /bulan_ini - Rekap bulan ini`;
+      `• /hari_ini | /minggu_ini | /bulan_ini\n\n` +
+      `<b>Perintah Hapus:</b>\n` +
+      `• /hapus_terakhir - Hapus 1 transaksi terakhir\n` +
+      `• /reset_semua - Hapus seluruh data pengeluaran Anda`;
 
     await sendTelegram(BOT_TOKEN, chatId, welcomeText);
     return res.status(200).send('OK');
   }
 
   try {
-    if (!SUPABASE_URL || !SUPABASE_KEY) {
-      throw new Error('Supabase URL atau Key belum diset.');
-    }
-    const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+    const supabase = createClient(SUPABASE_URL!, SUPABASE_KEY!);
 
-    // 2. Perintah Rekapitulasi
+    // 2. Handler Command Hapus Cepat
+    if (text === '/reset_semua') {
+      await supabase.from('expenses').delete().eq('user_id', userId);
+      await sendTelegram(BOT_TOKEN, chatId, '🗑️ <b>Semua data pengeluaran Anda berhasil dihapus bersih dari database.</b>');
+      return res.status(200).send('OK');
+    }
+
+    if (text === '/hapus_terakhir') {
+      const { data: lastItem } = await supabase
+        .from('expenses')
+        .select('id, description, amount')
+        .eq('user_id', userId)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .single();
+
+      if (!lastItem) {
+        await sendTelegram(BOT_TOKEN, chatId, '⚠️ Belum ada transaksi yang bisa dihapus.');
+        return res.status(200).send('OK');
+      }
+
+      await supabase.from('expenses').delete().eq('id', lastItem.id);
+      await sendTelegram(
+        BOT_TOKEN,
+        chatId,
+        `🗑️ <b>Transaksi terakhir dihapus:</b>\n• ${lastItem.description} (Rp ${Number(lastItem.amount).toLocaleString('id-ID')})`
+      );
+      return res.status(200).send('OK');
+    }
+
+    // 3. Handler Rekapitulasi
     if (text === '/hari_ini' || text === '/minggu_ini' || text === '/bulan_ini') {
+      await sendChatAction(BOT_TOKEN, chatId, 'typing');
       const now = new Date();
       let startDate = new Date();
 
-      if (text === '/hari_ini') {
-        startDate.setHours(0, 0, 0, 0);
-      } else if (text === '/minggu_ini') {
-        startDate.setDate(now.getDate() - 7);
-      } else if (text === '/bulan_ini') {
-        startDate = new Date(now.getFullYear(), now.getMonth(), 1);
-      }
+      if (text === '/hari_ini') startDate.setHours(0, 0, 0, 0);
+      if (text === '/minggu_ini') startDate.setDate(now.getDate() - 7);
+      if (text === '/bulan_ini') startDate = new Date(now.getFullYear(), now.getMonth(), 1);
 
       const { data, error } = await supabase
         .from('expenses')
@@ -159,12 +193,13 @@ export default async function handler(req: any, res: any) {
       return res.status(200).send('OK');
     }
 
-    // 3. Parsing Input (Teks / Foto Nota)
-    if (!GEMINI_KEY) {
-      throw new Error('GEMINI_API_KEY belum diset.');
-    }
+    // 4. Analisis Teks / Foto dengan Gemini
+    await sendChatAction(BOT_TOKEN, chatId, 'typing');
 
-    let parsedData: any = null;
+    let parsedResult: { intent: string; items: Array<{ amount: number; category: string; description: string }> } = {
+      intent: 'ADD_EXPENSE',
+      items: [],
+    };
 
     if (message.photo) {
       const photo = message.photo[message.photo.length - 1];
@@ -175,44 +210,79 @@ export default async function handler(req: any, res: any) {
       const imageBuffer = await fetch(fileUrl).then((r) => r.arrayBuffer());
       const base64Image = Buffer.from(imageBuffer).toString('base64');
 
-      parsedData = await parseWithGemini(
-        GEMINI_KEY,
-        'Ekstrak total nominal belanja, kategori utama, dan rincian transaksi dari gambar nota ini.',
+      parsedResult = await parseExpensesWithGemini(
+        GEMINI_KEY!,
+        'Analisis nota ini. Ekstrak setiap item barang/makanan yang dibeli beserta harganya.',
         base64Image
       );
     } else if (text) {
-      parsedData = await parseWithGemini(
-        GEMINI_KEY,
-        `Ekstrak nominal pengeluaran, kategori, dan rincian dari pesan ini: "${text}"`
+      parsedResult = await parseExpensesWithGemini(
+        GEMINI_KEY!,
+        `Analisis teks berikut. Jika user ingin menghapus data (misal: "hapus semua", "tolong hapus database"), set intent ke DELETE_ALL atau DELETE_LAST. Jika user mencatat pengeluaran, set intent ADD_EXPENSE dan ekstrak items: "${text}"`
       );
     } else {
       return res.status(200).send('OK');
     }
 
-    // 4. Simpan ke Supabase
-    if (parsedData?.amount) {
-      await supabase.from('expenses').insert({
-        user_id: userId,
-        amount: parsedData.amount,
-        category: parsedData.category || 'Lainnya',
-        description: parsedData.description || '-',
-      });
+    // Eksekusi Berdasarkan Intent AI
+    if (parsedResult.intent === 'DELETE_ALL') {
+      await supabase.from('expenses').delete().eq('user_id', userId);
+      await sendTelegram(BOT_TOKEN, chatId, '🗑️ <b>Semua data transaksi kamu sudah berhasil dihapus dari database!</b>');
+      return res.status(200).send('OK');
+    }
 
-      const replyText =
-        `✅ <b>Tercatat!</b>\n` +
-        `💵 <b>Nominal:</b> Rp ${Number(parsedData.amount).toLocaleString('id-ID')}\n` +
-        `📂 <b>Kategori:</b> ${parsedData.category}\n` +
-        `📝 <b>Keterangan:</b> ${parsedData.description}`;
+    if (parsedResult.intent === 'DELETE_LAST') {
+      const { data: lastItem } = await supabase
+        .from('expenses')
+        .select('id, description, amount')
+        .eq('user_id', userId)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .single();
+
+      if (lastItem) {
+        await supabase.from('expenses').delete().eq('id', lastItem.id);
+        await sendTelegram(
+          BOT_TOKEN,
+          chatId,
+          `🗑️ <b>Transaksi terakhir dihapus:</b>\n• ${lastItem.description} (Rp ${Number(lastItem.amount).toLocaleString('id-ID')})`
+        );
+      } else {
+        await sendTelegram(BOT_TOKEN, chatId, '⚠️ Tidak ada transaksi yang ditemukan untuk dihapus.');
+      }
+      return res.status(200).send('OK');
+    }
+
+    // Intent Tambah Pengeluaran
+    const items = parsedResult?.items || [];
+    if (items.length > 0) {
+      const insertPayload = items.map((item) => ({
+        user_id: userId,
+        amount: item.amount,
+        category: item.category || 'Lainnya',
+        description: item.description || '-',
+      }));
+
+      const { error: insertError } = await supabase.from('expenses').insert(insertPayload);
+      if (insertError) throw insertError;
+
+      const totalNominal = items.reduce((sum, item) => sum + Number(item.amount), 0);
+      let replyText = `✅ <b>${items.length} Transaksi Berhasil Dicatat!</b>\n`;
+      replyText += `💰 <b>Total:</b> Rp ${totalNominal.toLocaleString('id-ID')}\n\n<b>Rincian Item:</b>`;
+
+      items.forEach((item, index) => {
+        replyText += `\n${index + 1}. <b>${item.description}</b>: Rp ${Number(item.amount).toLocaleString('id-ID')} (<i>${item.category}</i>)`;
+      });
 
       await sendTelegram(BOT_TOKEN, chatId, replyText);
     } else {
-      await sendTelegram(BOT_TOKEN, chatId, '⚠️ Gagal mengenali format pengeluaran.');
+      await sendTelegram(BOT_TOKEN, chatId, '⚠️ Gagal mengenali format pengeluaran atau instruksi.');
     }
 
     return res.status(200).send('OK');
   } catch (err: any) {
-    console.error('Webhook Runtime Error:', err);
-    await sendTelegram(BOT_TOKEN, chatId, `❌ Terjadi kesalahan: ${err?.message || 'Server error'}`);
+    console.error('Execution Error:', err);
+    await sendTelegram(BOT_TOKEN, chatId, `❌ Terjadi kesalahan: ${err?.message || 'Gagal memproses'}`);
     return res.status(200).send('OK');
   }
 }
