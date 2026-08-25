@@ -1,5 +1,6 @@
 import { createClient } from '@supabase/supabase-js';
 
+// Helper Action Mengetik
 async function sendChatAction(token: string, chatId: number, action: 'typing' | 'upload_photo' = 'typing') {
   try {
     await fetch(`https://api.telegram.org/bot${token}/sendChatAction`, {
@@ -12,6 +13,7 @@ async function sendChatAction(token: string, chatId: number, action: 'typing' | 
   }
 }
 
+// Helper Kirim Pesan HTML Telegram
 async function sendTelegram(token: string, chatId: number, text: string) {
   try {
     const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
@@ -27,11 +29,24 @@ async function sendTelegram(token: string, chatId: number, text: string) {
   }
 }
 
-async function parseExpensesWithGemini(apiKey: string, promptText: string, imageBase64?: string) {
-  const parts: any[] = [{ text: promptText }];
+// Brain Engine: Intent & Query Engine menggunakan Gemini
+async function processWithGemini(apiKey: string, promptText: string, currentDate: string, imageBase64?: string) {
+  const parts: any[] = [
+    {
+      text: `Current Timestamp ISO: ${currentDate}.
+Instruksi: Analisis pesan atau foto berikut. Tentukan intent user dari 3 kemungkinan:
+1. "ADD_EXPENSE": Mencatat transaksi (satu/banyak item).
+2. "QUERY_EXPENSE": Bertanya total/rekap/rincian dengan filter dinamis (hari ini, minggu ini, hanya makanan, bulan lalu, dsb).
+3. "DELETE_EXPENSE": Menghapus data (semua, item terakhir, atau spesifik).
+
+Kembalikan response dalam JSON sesuai schema.`
+    },
+    { text: promptText }
+  ];
+
   if (imageBase64) {
     parts.unshift({
-      inline_data: { mime_type: 'image/jpeg', data: imageBase64 },
+      inline_data: { mime_type: 'image/jpeg', data: imageBase64 }
     });
   }
 
@@ -47,28 +62,39 @@ async function parseExpensesWithGemini(apiKey: string, promptText: string, image
           response_schema: {
             type: 'OBJECT',
             properties: {
-              intent: { 
-                type: 'STRING', 
-                description: 'Tujuan user: "ADD_EXPENSE" jika mencatat, "DELETE_ALL" jika meminta menghapus semua data, "DELETE_LAST" jika menghapus input terakhir' 
-              },
+              intent: { type: 'STRING', description: 'ADD_EXPENSE | QUERY_EXPENSE | DELETE_EXPENSE' },
               items: {
                 type: 'ARRAY',
-                description: 'Daftar item belanja jika intent ADD_EXPENSE',
+                description: 'Daftar item jika ADD_EXPENSE',
                 items: {
                   type: 'OBJECT',
                   properties: {
-                    description: { type: 'STRING', description: 'Nama barang / keterangan' },
-                    amount: { type: 'NUMBER', description: 'Nominal harga angka saja' },
-                    category: { type: 'STRING', description: 'Kategori (Makanan, Minuman, Belanja, Transportasi, Tagihan, Lainnya)' },
+                    description: { type: 'STRING' },
+                    amount: { type: 'NUMBER' },
+                    category: { type: 'STRING', description: 'Makanan, Minuman, Belanja, Transportasi, Tagihan, Hiburan, Lainnya' }
                   },
-                  required: ['description', 'amount', 'category'],
-                },
+                  required: ['description', 'amount', 'category']
+                }
               },
+              query_filter: {
+                type: 'OBJECT',
+                description: 'Filter query jika QUERY_EXPENSE',
+                properties: {
+                  start_date: { type: 'STRING', description: 'ISO date string awal filter (contoh: 2026-08-25T00:00:00.000Z)' },
+                  end_date: { type: 'STRING', description: 'ISO date string akhir filter' },
+                  category: { type: 'STRING', description: 'Nama kategori jika user meminta kategori tertentu (misal: Makanan), kosongkan jika semua' },
+                  title: { type: 'STRING', description: 'Judul ringkasan laporan (misal: Pengeluaran Makanan Hari Ini)' }
+                }
+              },
+              delete_type: { 
+                type: 'STRING', 
+                description: '"ALL" jika hapus semua, "LAST" jika hapus 1 terakhir' 
+              }
             },
-            required: ['intent', 'items'],
-          },
-        },
-      }),
+            required: ['intent']
+          }
+        }
+      })
     }
   );
 
@@ -83,7 +109,7 @@ async function parseExpensesWithGemini(apiKey: string, promptText: string, image
 }
 
 export default async function handler(req: any, res: any) {
-  if (req.method !== 'POST') return res.status(200).send('Webhook active');
+  if (req.method !== 'POST') return res.status(200).send('Webhook ready');
 
   const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN?.trim();
   const ALLOWED_USER_ID = process.env.ALLOWED_USER_ID ? Number(process.env.ALLOWED_USER_ID.trim()) : null;
@@ -91,7 +117,7 @@ export default async function handler(req: any, res: any) {
   const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY?.trim();
   const GEMINI_KEY = process.env.GEMINI_API_KEY?.trim();
 
-  if (!BOT_TOKEN) return res.status(200).send('Missing token');
+  if (!BOT_TOKEN) return res.status(200).send('Missing BOT_TOKEN');
 
   let update = req.body;
   if (typeof update === 'string') {
@@ -106,100 +132,33 @@ export default async function handler(req: any, res: any) {
   const text = message.text?.trim() || message.caption?.trim() || '';
 
   if (ALLOWED_USER_ID && userId !== ALLOWED_USER_ID) {
-    await sendTelegram(BOT_TOKEN, chatId, `⛔ Akses ditolak. ID Anda: <code>${userId}</code>`);
+    await sendTelegram(BOT_TOKEN, chatId, `⛔ Akses ditolak. ID Akun: <code>${userId}</code>`);
     return res.status(200).send('OK');
   }
 
-  // 1. Menu Perintah Cepat
+  // Info Dasar
   if (text === '/start' || text === '/bantuan') {
-    const welcomeText =
-      `👋 <b>Halo! Bot Pencatat Pengeluaran Siap Digunakan.</b>\n\n` +
-      `<b>Cara Input:</b>\n` +
-      `• Teks: "Makan siang 25rb"\n` +
-      `• Foto: Kirim foto struk belanja\n\n` +
-      `<b>Perintah Rekap:</b>\n` +
-      `• /hari_ini | /minggu_ini | /bulan_ini\n\n` +
-      `<b>Perintah Hapus:</b>\n` +
-      `• /hapus_terakhir - Hapus 1 transaksi terakhir\n` +
-      `• /reset_semua - Hapus seluruh data pengeluaran Anda`;
-
-    await sendTelegram(BOT_TOKEN, chatId, welcomeText);
+    await sendTelegram(
+      BOT_TOKEN,
+      chatId,
+      `👋 <b>Bot AI Finansial Pribadi Siap!</b>\n\n` +
+      `Kamu bisa berbicara santai dan fleksibel, contoh:\n` +
+      `• <i>"Makan bakso 25rb sama es teh 5rb"</i>\n` +
+      `• <i>"Kirim foto nota struk belanja"</i>\n` +
+      `• <i>"Coba berikan saya rincian hari ini tapi hanya makanan saja"</i>\n` +
+      `• <i>"Total pengeluaran bensin minggu ini berapa?"</i>\n` +
+      `• <i>"Hapus data terakhir dong"</i> atau <i>"Reset semua data"</i>`
+    );
     return res.status(200).send('OK');
   }
+
+  await sendChatAction(BOT_TOKEN, chatId, 'typing');
 
   try {
     const supabase = createClient(SUPABASE_URL!, SUPABASE_KEY!);
+    const nowIso = new Date().toISOString();
 
-    // 2. Handler Command Hapus Cepat
-    if (text === '/reset_semua') {
-      await supabase.from('expenses').delete().eq('user_id', userId);
-      await sendTelegram(BOT_TOKEN, chatId, '🗑️ <b>Semua data pengeluaran Anda berhasil dihapus bersih dari database.</b>');
-      return res.status(200).send('OK');
-    }
-
-    if (text === '/hapus_terakhir') {
-      const { data: lastItem } = await supabase
-        .from('expenses')
-        .select('id, description, amount')
-        .eq('user_id', userId)
-        .order('created_at', { ascending: false })
-        .limit(1)
-        .single();
-
-      if (!lastItem) {
-        await sendTelegram(BOT_TOKEN, chatId, '⚠️ Belum ada transaksi yang bisa dihapus.');
-        return res.status(200).send('OK');
-      }
-
-      await supabase.from('expenses').delete().eq('id', lastItem.id);
-      await sendTelegram(
-        BOT_TOKEN,
-        chatId,
-        `🗑️ <b>Transaksi terakhir dihapus:</b>\n• ${lastItem.description} (Rp ${Number(lastItem.amount).toLocaleString('id-ID')})`
-      );
-      return res.status(200).send('OK');
-    }
-
-    // 3. Handler Rekapitulasi
-    if (text === '/hari_ini' || text === '/minggu_ini' || text === '/bulan_ini') {
-      await sendChatAction(BOT_TOKEN, chatId, 'typing');
-      const now = new Date();
-      let startDate = new Date();
-
-      if (text === '/hari_ini') startDate.setHours(0, 0, 0, 0);
-      if (text === '/minggu_ini') startDate.setDate(now.getDate() - 7);
-      if (text === '/bulan_ini') startDate = new Date(now.getFullYear(), now.getMonth(), 1);
-
-      const { data, error } = await supabase
-        .from('expenses')
-        .select('amount, category, description')
-        .eq('user_id', userId)
-        .gte('created_at', startDate.toISOString());
-
-      if (error || !data || data.length === 0) {
-        await sendTelegram(BOT_TOKEN, chatId, `📊 Belum ada data pengeluaran untuk periode ini.`);
-        return res.status(200).send('OK');
-      }
-
-      const total = data.reduce((acc: number, curr: any) => acc + Number(curr.amount), 0);
-      let summary = `📊 <b>Rekap Pengeluaran (${text.replace('/', '')})</b>\n`;
-      summary += `💰 <b>Total:</b> Rp ${total.toLocaleString('id-ID')}\n\n<b>Rincian:</b>`;
-
-      data.forEach((item: any) => {
-        summary += `\n• [${item.category}] Rp ${Number(item.amount).toLocaleString('id-ID')} - ${item.description || '-'}`;
-      });
-
-      await sendTelegram(BOT_TOKEN, chatId, summary);
-      return res.status(200).send('OK');
-    }
-
-    // 4. Analisis Teks / Foto dengan Gemini
-    await sendChatAction(BOT_TOKEN, chatId, 'typing');
-
-    let parsedResult: { intent: string; items: Array<{ amount: number; category: string; description: string }> } = {
-      intent: 'ADD_EXPENSE',
-      items: [],
-    };
+    let aiResult: any = null;
 
     if (message.photo) {
       const photo = message.photo[message.photo.length - 1];
@@ -207,82 +166,111 @@ export default async function handler(req: any, res: any) {
       const fileData = await fileRes.json();
       const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${fileData.result.file_path}`;
 
-      const imageBuffer = await fetch(fileUrl).then((r) => r.arrayBuffer());
-      const base64Image = Buffer.from(imageBuffer).toString('base64');
+      const buffer = await fetch(fileUrl).then((r) => r.arrayBuffer());
+      const base64 = Buffer.from(buffer).toString('base64');
 
-      parsedResult = await parseExpensesWithGemini(
-        GEMINI_KEY!,
-        'Analisis nota ini. Ekstrak setiap item barang/makanan yang dibeli beserta harganya.',
-        base64Image
-      );
-    } else if (text) {
-      parsedResult = await parseExpensesWithGemini(
-        GEMINI_KEY!,
-        `Analisis teks berikut. Jika user ingin menghapus data (misal: "hapus semua", "tolong hapus database"), set intent ke DELETE_ALL atau DELETE_LAST. Jika user mencatat pengeluaran, set intent ADD_EXPENSE dan ekstrak items: "${text}"`
-      );
+      aiResult = await processWithGemini(GEMINI_KEY!, text || 'Analisis nota ini dan catat semua itemnya.', nowIso, base64);
     } else {
-      return res.status(200).send('OK');
+      aiResult = await processWithGemini(GEMINI_KEY!, text, nowIso);
     }
 
-    // Eksekusi Berdasarkan Intent AI
-    if (parsedResult.intent === 'DELETE_ALL') {
-      await supabase.from('expenses').delete().eq('user_id', userId);
-      await sendTelegram(BOT_TOKEN, chatId, '🗑️ <b>Semua data transaksi kamu sudah berhasil dihapus dari database!</b>');
-      return res.status(200).send('OK');
-    }
+    // 1. INTENT: QUERY EXPENSE (Filter Dinamis & Bahasa Natural)
+    if (aiResult.intent === 'QUERY_EXPENSE') {
+      const filter = aiResult.query_filter || {};
+      let query = supabase.from('expenses').select('amount, category, description, created_at').eq('user_id', userId);
 
-    if (parsedResult.intent === 'DELETE_LAST') {
-      const { data: lastItem } = await supabase
-        .from('expenses')
-        .select('id, description, amount')
-        .eq('user_id', userId)
-        .order('created_at', { ascending: false })
-        .limit(1)
-        .single();
-
-      if (lastItem) {
-        await supabase.from('expenses').delete().eq('id', lastItem.id);
-        await sendTelegram(
-          BOT_TOKEN,
-          chatId,
-          `🗑️ <b>Transaksi terakhir dihapus:</b>\n• ${lastItem.description} (Rp ${Number(lastItem.amount).toLocaleString('id-ID')})`
-        );
+      if (filter.start_date) {
+        query = query.gte('created_at', filter.start_date);
       } else {
-        await sendTelegram(BOT_TOKEN, chatId, '⚠️ Tidak ada transaksi yang ditemukan untuk dihapus.');
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+        query = query.gte('created_at', today.toISOString());
+      }
+
+      if (filter.end_date) {
+        query = query.lte('created_at', filter.end_date);
+      }
+
+      if (filter.category) {
+        query = query.ilike('category', `%${filter.category}%`);
+      }
+
+      const { data, error } = await query.order('created_at', { ascending: true });
+
+      if (error || !data || data.length === 0) {
+        const catInfo = filter.category ? ` untuk kategori <b>${filter.category}</b>` : '';
+        await sendTelegram(BOT_TOKEN, chatId, `📊 Tidak ditemukan catatan pengeluaran${catInfo} pada periode tersebut.`);
+        return res.status(200).send('OK');
+      }
+
+      const total = data.reduce((acc: number, curr: any) => acc + Number(curr.amount), 0);
+      const title = filter.title || 'Laporan Pengeluaran';
+
+      let reply = `📊 <b>${title}</b>\n💰 <b>Total:</b> Rp ${total.toLocaleString('id-ID')}\n\n<b>Rincian:</b>`;
+      data.forEach((item: any, idx: number) => {
+        reply += `\n${idx + 1}. <b>${item.description}</b> (<i>${item.category}</i>): Rp ${Number(item.amount).toLocaleString('id-ID')}`;
+      });
+
+      await sendTelegram(BOT_TOKEN, chatId, reply);
+      return res.status(200).send('OK');
+    }
+
+    // 2. INTENT: DELETE EXPENSE
+    if (aiResult.intent === 'DELETE_EXPENSE') {
+      if (aiResult.delete_type === 'ALL') {
+        await supabase.from('expenses').delete().eq('user_id', userId);
+        await sendTelegram(BOT_TOKEN, chatId, '🗑️ <b>Semua data pengeluaran kamu telah dihapus bersih.</b>');
+      } else {
+        const { data: lastItem } = await supabase
+          .from('expenses')
+          .select('id, description, amount')
+          .eq('user_id', userId)
+          .order('created_at', { ascending: false })
+          .limit(1)
+          .single();
+
+        if (lastItem) {
+          await supabase.from('expenses').delete().eq('id', lastItem.id);
+          await sendTelegram(
+            BOT_TOKEN,
+            chatId,
+            `🗑️ <b>Transaksi terakhir dihapus:</b>\n• ${lastItem.description} (Rp ${Number(lastItem.amount).toLocaleString('id-ID')})`
+          );
+        } else {
+          await sendTelegram(BOT_TOKEN, chatId, '⚠️ Tidak ada data untuk dihapus.');
+        }
       }
       return res.status(200).send('OK');
     }
 
-    // Intent Tambah Pengeluaran
-    const items = parsedResult?.items || [];
+    // 3. INTENT: ADD EXPENSE (Catat Transaksi Baru)
+    const items = aiResult.items || [];
     if (items.length > 0) {
-      const insertPayload = items.map((item) => ({
+      const payload = items.map((it: any) => ({
         user_id: userId,
-        amount: item.amount,
-        category: item.category || 'Lainnya',
-        description: item.description || '-',
+        amount: it.amount,
+        category: it.category || 'Lainnya',
+        description: it.description || '-',
       }));
 
-      const { error: insertError } = await supabase.from('expenses').insert(insertPayload);
-      if (insertError) throw insertError;
+      const { error: insErr } = await supabase.from('expenses').insert(payload);
+      if (insErr) throw insErr;
 
-      const totalNominal = items.reduce((sum, item) => sum + Number(item.amount), 0);
-      let replyText = `✅ <b>${items.length} Transaksi Berhasil Dicatat!</b>\n`;
-      replyText += `💰 <b>Total:</b> Rp ${totalNominal.toLocaleString('id-ID')}\n\n<b>Rincian Item:</b>`;
-
-      items.forEach((item, index) => {
-        replyText += `\n${index + 1}. <b>${item.description}</b>: Rp ${Number(item.amount).toLocaleString('id-ID')} (<i>${item.category}</i>)`;
+      const total = items.reduce((acc: number, it: any) => acc + Number(it.amount), 0);
+      let reply = `✅ <b>${items.length} Transaksi Tercatat!</b>\n💰 <b>Total:</b> Rp ${total.toLocaleString('id-ID')}\n\n<b>Item:</b>`;
+      items.forEach((it: any, i: number) => {
+        reply += `\n${i + 1}. <b>${it.description}</b>: Rp ${Number(it.amount).toLocaleString('id-ID')} (<i>${it.category}</i>)`;
       });
 
-      await sendTelegram(BOT_TOKEN, chatId, replyText);
+      await sendTelegram(BOT_TOKEN, chatId, reply);
     } else {
-      await sendTelegram(BOT_TOKEN, chatId, '⚠️ Gagal mengenali format pengeluaran atau instruksi.');
+      await sendTelegram(BOT_TOKEN, chatId, '⚠️ Pesan tidak dikenali sebagai transaksi, rekap, atau hapus data.');
     }
 
     return res.status(200).send('OK');
   } catch (err: any) {
-    console.error('Execution Error:', err);
-    await sendTelegram(BOT_TOKEN, chatId, `❌ Terjadi kesalahan: ${err?.message || 'Gagal memproses'}`);
+    console.error('Webhook Runtime Error:', err);
+    await sendTelegram(BOT_TOKEN, chatId, `❌ Error: ${err.message || 'Gagal memproses'}`);
     return res.status(200).send('OK');
   }
 }
